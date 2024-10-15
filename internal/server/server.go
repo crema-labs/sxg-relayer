@@ -2,6 +2,7 @@ package server
 
 import (
 	"github.com/crema-labs/sxg-go/internal/handler"
+	"go.uber.org/zap"
 
 	"github.com/gin-gonic/gin"
 )
@@ -9,11 +10,12 @@ import (
 type Server struct {
 	router   *gin.Engine
 	priv_key string
+	logger   *zap.Logger
 }
 
-func NewServer(priv_key string) *Server {
+func NewServer(priv_key string, logger *zap.Logger) *Server {
 	r := gin.Default()
-	s := &Server{router: r, priv_key: priv_key}
+	s := &Server{router: r, priv_key: priv_key, logger: logger}
 	s.registerRoutes()
 	return s
 }
@@ -21,8 +23,10 @@ func NewServer(priv_key string) *Server {
 func (s *Server) registerRoutes() {
 	hpr := handler.HandleProofRequest{
 		PrivKey: s.priv_key,
+		Logger:  s.logger,
 	}
-	s.router.POST("/", hpr.HandlePost)
+	s.router.POST("/proof", hpr.GenerateProofRequest)
+	s.router.GET("/status", hpr.GetProofStatus)
 }
 
 func (s *Server) Run(addr string) error {

@@ -3,17 +3,21 @@ package handler
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/WICG/webpackage/go/signedexchange"
 	"github.com/WICG/webpackage/go/signedexchange/version"
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 var latestVersion = string(version.AllVersions[len(version.AllVersions)-1])
@@ -22,22 +26,18 @@ type ProofRequest struct {
 	Data      string `json:"data"`
 	SourceUrl string `json:"source_url"`
 }
-
-type ProofResponse struct {
-	Proof string `json:"proof"`
+type StatusResponse struct {
+	Status     string         `json:"status,omitempty"`
+	TrackingId string         `json:"tracking_id,omitempty"`
+	Result     *ProofResponse `json:"result,omitempty"`
 }
 
-// pub struct SXGInput {
-// 	pub final_payload: Vec<u8>,
-// 	pub data_to_verify: Vec<u8>,
-// 	pub data_to_verify_start_index: usize,
-// 	pub integrity_start_index: usize,
-// 	pub payload: Vec<u8>,
-// 	pub r: [u8; 32],
-// 	pub s: [u8; 32],
-// 	pub px: [u8; 32],
-// 	pub py: [u8; 32],
-//     }
+type ProofResponse struct {
+	Result          int    `json:"result"`
+	VerificationKey string `json:"vkey"`
+	PublicKey       string `json:"publicValues"`
+	ProofBytes      string `json:"proof"`
+}
 
 type ProofInput struct {
 	FinalPayload           []byte   `json:"final_payload"`
@@ -86,10 +86,126 @@ func bytesToIntSlice(b []byte) []int {
 }
 
 type HandleProofRequest struct {
+	Logger  *zap.Logger
 	PrivKey string
 }
 
-func (hp *HandleProofRequest) HandlePost(c *gin.Context) {
+// func (hp *HandleProofRequest) GetProofStatus(c *gin.Context) {
+// 	reqId := strings.ToLower(c.Query("reqId"))
+// 	res := StatusResponse{}
+
+// 	// check if reqId-fixture.json exists
+// 	filename := fmt.Sprintf("%s-fixture.json", reqId)
+// 	if _, err := os.Stat(filename); os.IsNotExist(err) {
+// 		if _, err := os.Stat(fmt.Sprintf("%s.json", reqId)); os.IsNotExist(err) {
+
+// 			c.JSON(http.StatusNotFound, gin.H{
+// 				"error": "proof request not found",
+// 			})
+// 			return
+// 		} else {
+// 			res.Status = "processing"
+// 			c.JSON(http.StatusAccepted, res)
+// 			return
+// 		}
+// 	}
+
+// 	// read the file
+// 	data, err := os.ReadFile(filename)
+// 	if err != nil {
+// 		log.Printf("Failed to read file: %v", err)
+// 		c.JSON(http.StatusInternalServerError, gin.H{
+// 			"error": "internal server error",
+// 		})
+// 		return
+// 	}
+
+// 	proof := ProofResponse{}
+
+// 	if err := json.Unmarshal(data, &proof); err != nil {
+// 		log.Printf("Failed to unmarshal JSON: %v", err)
+// 		c.JSON(http.StatusInternalServerError, gin.H{
+// 			"error": "internal server error",
+// 		})
+// 		return
+// 	}
+
+// 	res.Status = "completed"
+// 	res.Result = &proof
+// 	c.JSON(http.StatusOK, res)
+// }
+
+func (hp *HandleProofRequest) GetProofStatus(c *gin.Context) {
+	reqId := strings.ToLower(c.Query("reqId"))
+	res := StatusResponse{}
+
+	// Check if reqId-fixture.json exists
+	filename := fmt.Sprintf("%s-fixture.json", reqId)
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
+		if _, err := os.Stat(fmt.Sprintf("%s.json", reqId)); os.IsNotExist(err) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": "proof request not found",
+			})
+			return
+		} else {
+			res.Status = "processing"
+			logFileName := fmt.Sprintf("%s.log", reqId)
+			if _, err := os.Stat(logFileName); err == nil {
+				// Log file exists, let's parse it for the tracking ID
+				logContent, err := os.ReadFile(logFileName)
+				if err == nil {
+					trackingID := extractTrackingID(string(logContent))
+					if trackingID != "" {
+						res.TrackingId = fmt.Sprintf("https://explorer.succinct.xyz/%s", trackingID)
+						c.JSON(http.StatusOK, res)
+						return
+					}
+				}
+			}
+			c.JSON(http.StatusAccepted, res)
+			return
+		}
+	}
+
+	// Read the fixture file
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		hp.Logger.Error("Failed to read file", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "internal server error",
+		})
+		return
+	}
+
+	proof := ProofResponse{}
+
+	if err := json.Unmarshal(data, &proof); err != nil {
+		hp.Logger.Error("Failed to unmarshal JSON", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "internal server error",
+		})
+		return
+	}
+
+	res.Status = "completed"
+	res.Result = &proof
+	c.JSON(http.StatusOK, res)
+}
+
+func extractTrackingID(logContent string) string {
+	lines := strings.Split(logContent, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "View in explorer: https://explorer.succinct.xyz/") {
+			parts := strings.Split(line, "/")
+			if len(parts) > 0 {
+				return strings.TrimSpace(parts[len(parts)-1])
+			}
+		}
+	}
+	return ""
+}
+
+func (hp *HandleProofRequest) GenerateProofRequest(c *gin.Context) {
 	// generate random hex string
 
 	var req ProofRequest
@@ -100,8 +216,9 @@ func (hp *HandleProofRequest) HandlePost(c *gin.Context) {
 		return
 	}
 	reqid := sha256.Sum256([]byte(fmt.Sprintf("%v", req)))
+	reqidStr := strings.ToLower(hex.EncodeToString(reqid[:]))
 
-	if err := validateProofRequest(req); err != nil {
+	if err := validateProofRequest(req, reqidStr); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": err.Error(),
 		})
@@ -180,7 +297,7 @@ func (hp *HandleProofRequest) HandlePost(c *gin.Context) {
 	}
 
 	// Write the JSON data to a file
-	filename := fmt.Sprintf("%x.json", reqid)
+	filename := fmt.Sprintf("%s.json", reqidStr)
 	err = os.WriteFile(filename, jsonData, 0644)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -189,8 +306,40 @@ func (hp *HandleProofRequest) HandlePost(c *gin.Context) {
 		return
 	}
 
+	// Create a log file for the command output
+	logFileName := fmt.Sprintf("%s.log", reqidStr)
+	logFile, err := os.Create(logFileName)
+	if err != nil {
+		hp.Logger.Error("Failed to create log file", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("Failed to create log file: %v", err),
+		})
+		return
+	}
+	defer logFile.Close()
+
+	// Prepare the CLI command
+	cmdArgs := []string{"--system", "groth16", "--input-file-id", reqidStr}
+	cmd := exec.Command("/Users/yash/Desktop/crema/sxg-go/cmd/bin/sp1-prover", cmdArgs...)
+
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.Env = append(os.Environ(), "SP1_PROVER=network", "SP1_PRIVATE_KEY="+hp.PrivKey, "RUST_LOG=info")
+
+	err = cmd.Start()
+	if err != nil {
+		hp.Logger.Error("Failed to start Rust program", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("Failed to start Rust program: %v", err),
+		})
+		return
+	}
+
+	// Log the process ID for debugging purposes
+	hp.Logger.Info("Started Rust program", zap.Int("pid", cmd.Process.Pid))
+
 	c.JSON(http.StatusOK, gin.H{
-		"reqId": fmt.Sprintf("%x", reqid),
+		"reqId": reqidStr,
 	})
 }
 
@@ -234,7 +383,6 @@ func verifySXG(sourceUrl string, data string) (*signedexchange.Exchange, error) 
 func verify(e *signedexchange.Exchange, certFetcher signedexchange.CertFetcher, verificationTime time.Time) error {
 	if decodedPayload, ok := e.Verify(verificationTime, certFetcher, log.New(os.Stdout, "", 0)); ok {
 		e.Payload = decodedPayload
-		fmt.Println("The exchange has a valid signature.")
 		return nil
 	}
 	return fmt.Errorf("The exchange has an invalid signature.")
@@ -251,12 +399,19 @@ func findByteArray(a, b []byte) int {
 	return bytes.Index(b, a)
 }
 
-func validateProofRequest(req ProofRequest) error {
+func validateProofRequest(req ProofRequest, reqId string) error {
 	if req.Data == "" {
 		return fmt.Errorf("data is required")
 	}
 	if req.SourceUrl == "" {
 		return fmt.Errorf("SourceUrl is required")
 	}
+
+	// Check if reqId.json exists
+	filename := fmt.Sprintf("%s.json", reqId)
+	if _, err := os.Stat(filename); err == nil {
+		return fmt.Errorf("proof request already exists, try getting status, reqId: %s", reqId)
+	}
+
 	return nil
 }
