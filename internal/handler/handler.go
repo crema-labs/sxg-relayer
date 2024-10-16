@@ -29,7 +29,7 @@ type ProofRequest struct {
 type StatusResponse struct {
 	Status     string         `json:"status,omitempty"`
 	TrackingId string         `json:"tracking_id,omitempty"`
-	Result     *ProofResponse `json:"result,omitempty"`
+	Proof      *ProofResponse `json:"proof,omitempty"`
 }
 
 type ProofResponse struct {
@@ -139,6 +139,18 @@ func (hp *HandleProofRequest) GetProofStatus(c *gin.Context) {
 	reqId := strings.ToLower(c.Query("reqId"))
 	res := StatusResponse{}
 
+	logFileName := fmt.Sprintf("%s.log", reqId)
+	if _, err := os.Stat(logFileName); err == nil {
+		// Log file exists, let's parse it for the tracking ID
+		logContent, err := os.ReadFile(logFileName)
+		if err == nil {
+			trackingID := extractTrackingID(string(logContent))
+			if trackingID != "" {
+				res.TrackingId = fmt.Sprintf("https://explorer.succinct.xyz/%s", trackingID)
+			}
+		}
+	}
+
 	// Check if reqId-fixture.json exists
 	filename := fmt.Sprintf("%s-fixture.json", reqId)
 	if _, err := os.Stat(filename); os.IsNotExist(err) {
@@ -149,19 +161,6 @@ func (hp *HandleProofRequest) GetProofStatus(c *gin.Context) {
 			return
 		} else {
 			res.Status = "processing"
-			logFileName := fmt.Sprintf("%s.log", reqId)
-			if _, err := os.Stat(logFileName); err == nil {
-				// Log file exists, let's parse it for the tracking ID
-				logContent, err := os.ReadFile(logFileName)
-				if err == nil {
-					trackingID := extractTrackingID(string(logContent))
-					if trackingID != "" {
-						res.TrackingId = fmt.Sprintf("https://explorer.succinct.xyz/%s", trackingID)
-						c.JSON(http.StatusOK, res)
-						return
-					}
-				}
-			}
 			c.JSON(http.StatusAccepted, res)
 			return
 		}
@@ -188,7 +187,7 @@ func (hp *HandleProofRequest) GetProofStatus(c *gin.Context) {
 	}
 
 	res.Status = "completed"
-	res.Result = &proof
+	res.Proof = &proof
 	c.JSON(http.StatusOK, res)
 }
 
